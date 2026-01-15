@@ -8,25 +8,64 @@ import cohere
 import anthropic
 from openai import OpenAI
 import os
+import subprocess
 
 
 client_oi = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-modelSource = "gpt-4o"
+modelSource = "gpt-5.1"
 
 co = cohere.Client(os.environ["COHERE_API_KEY"])
-modelco= 'command-nightly'
+modelco= 'command-a-03-2025'
 
 client_an = anthropic.Anthropic()
-model = "claude-3-opus-20240229"
+model = "claude-sonnet-4-5-20250929"
 
 
 translator = GoogleTranslator(source='en', target='iw')
 input_text = ' '.join(sys.argv[1:])  # Join all command-line arguments after the script name
 
+# trans (translate-shell)
+try:
+    result = subprocess.run(['trans', '-t', 'iw', '-b', '--no-bidi', input_text], 
+                          capture_output=True, text=True, timeout=5)
+    if result.returncode == 0 and result.stdout.strip():
+        print("translate-shell:")
+        print(" " + result.stdout.strip())
+except Exception as e:
+    pass
+
+# deep-translator (command-line)
+try:
+    result = subprocess.run(['deep-translator', '--source', 'en', '--target', 'iw', '--text', input_text], 
+                          capture_output=True, text=True, timeout=5)
+    if result.returncode == 0 and result.stdout.strip():
+        # Extract only the translation result after "Translation result:"
+        output = result.stdout.strip()
+        if "Translation result:" in output:
+            translation = output.split("Translation result:")[-1].strip()
+            print("deep-translator:")
+            print(" " + translation)
+        else:
+            print("deep-translator:")
+            print(" " + output)
+except Exception as e:
+    pass
+
+# googletrans library
+try:
+    from googletrans import Translator
+    gt = Translator()
+    result = gt.translate(input_text, dest='iw').text
+    if result:
+        print("googletrans library:")
+        print(" " + result)
+except Exception as e:
+    pass
+
 try:
     result = translator.translate(input_text)
     if result:
-        print("google translator:\n",result)
+        print("google:\n",result)
     else:
         print("Translation failed. No text returned.")
 except Exception as e:
@@ -36,10 +75,11 @@ except Exception as e:
 try:
     text=""
     token_count=0
-    for event in co.chat_stream(
+    for event in co.chat(
             model=modelco,
             message="translate this to hebrew: "+input_text,
             temperature=0.7,
+            stream=True,
             preamble="""you are transaltor expert in english and hebrew. 
             you going to translate from english to hebrew.
             your respond should be only the translate nothing else.
@@ -55,7 +95,7 @@ try:
         elif event.event_type == "stream-end":
             break
     
-    print("cohere ai translate:")
+    print("cohere:")
     print(" "+text, end='', flush=True)  # Print each piece on the same line
     print("")
 except Exception as e:
@@ -91,7 +131,9 @@ try:
     print(text, end='', flush=True)
     print("")
 except Exception as e:
- pass
+    if "credit balance" not in str(e).lower():
+        pass
+    # Silently skip if no credits
 
 try:
     text=""
@@ -117,7 +159,7 @@ try:
     ],
     stream=True,
     temperature=1,
-    max_tokens=3000
+    max_completion_tokens=3000
     )
     # temptext = response.choices[0].delta.content
     # print(response)
@@ -125,7 +167,7 @@ try:
         if chunk.choices[0].delta.content is not None:  
             temptext = chunk.choices[0].delta.content
             text+=temptext
-    print("chatgpt translate:")
+    print("chatgpt:")
     print(" "+text,end="",flush=True)      
     print("")
 
