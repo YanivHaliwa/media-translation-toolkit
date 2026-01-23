@@ -9,13 +9,24 @@ import anthropic
 from openai import OpenAI
 import os
 import subprocess
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+try:
+    import requests
+except Exception:
+    requests = None
 
+
+TRW_OLLAMA_MAX_WORKERS = 3  # Suggested: 1-3 for cloud; start with 2
+TRW_OLLAMA_READ_TIMEOUT = 15  # seconds; Suggested: 20-60
+TRW_OLLAMA_SHOW_ERRORS = 0 # 1=show errors/timeouts, 0=hide
+TRW_OLLAMA_MODEL_FILTER = "gpt-oss|gemma3|gemini|glm"   
 
 client_oi = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 modelSource = "gpt-5.1"
 
 co = cohere.Client(os.environ["COHERE_API_KEY"])
-modelco= 'command-a-03-2025'
+modelco= 'command-a-translate-08-2025'
 
 client_an = anthropic.Anthropic()
 model = "claude-sonnet-4-5-20250929"
@@ -174,3 +185,214 @@ try:
 except Exception as e:
     pass
 #     print("Translation failed. Error:", str(e))
+
+
+# Ollama translations
+try:
+    def _find_first_string(obj):
+        if isinstance(obj, str):
+            return obj
+        if isinstance(obj, dict):
+            for v in obj.values():
+                r = _find_first_string(v)
+                if r:
+                    return r
+        if isinstance(obj, list):
+            for v in obj:
+                r = _find_first_string(v)
+                if r:
+                    return r
+        return None
+
+    def _env_float(name, default):
+        val = os.environ.get(name, "").strip()
+        try:
+            return float(val) if val else default
+        except Exception:
+            return default
+
+    def _ollama_timeout():
+        connect_timeout = _env_float("TRW_OLLAMA_CONNECT_TIMEOUT", 3)
+        read_timeout = float(TRW_OLLAMA_READ_TIMEOUT)
+        return (connect_timeout, read_timeout)
+
+    def _get_model_filter():
+        f = str(TRW_OLLAMA_MODEL_FILTER or "").strip()
+        if not f:
+            f = os.environ.get("TRW_OLLAMA_MODEL_FILTER", "").strip()
+        return f
+
+    def _label_for_model(model_name):
+        model_filter = _get_model_filter()
+        if model_filter:
+            try:
+                import re
+                m = re.search(model_filter, model_name)
+                if m and m.group(0):
+                    return m.group(0)
+            except Exception:
+                pass
+        base = model_name.split(":", 1)[0] if ":" in model_name else model_name
+        return base
+
+    def _list_ollama_models(timeout):
+        if not requests:
+            return []
+
+        models_env = os.environ.get("TRW_OLLAMA_MODELS", "").strip()
+        if models_env:
+            out = []
+            for part in models_env.split(","):
+                name = part.strip()
+                if name:
+                    out.append(name)
+            return out
+
+        url = "http://127.0.0.1:11434/api/tags"
+        try:
+            resp = requests.get(url, timeout=timeout)
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            models = []
+            for m in data.get("models", []):
+                name = m.get("name") or m.get("model")
+                if isinstance(name, str) and name.strip():
+                    models.append(name.strip())
+
+            model_filter = _get_model_filter()
+            if model_filter:
+                try:
+                    import re
+                    pat = re.compile(model_filter)
+                    models = [n for n in models if pat.search(n)]
+                except Exception:
+                    pass
+
+            seen = set()
+            out = []
+            for n in models:
+                if n not in seen:
+                    seen.add(n)
+                    out.append(n)
+            return out
+        except Exception:
+            return []
+
+    def _call_ollama(model_name, text, timeout, num_predict):
+        if not requests:
+            return None, "requests unavailable"
+        url = "http://127.0.0.1:11434/api/generate"
+        prompt = (
+            "HEBREW ONLY. Translate English to Hebrew. Keep meaning/slang.\n"
+            "No analysis. No explanations. Output only the Hebrew translation:\n\n"
+            + text
+        )
+        payload = {
+            "model": model_name,
+            "prompt": prompt,
+            "stream": False,
+        }
+        headers = {"Content-Type": "application/json"}
+        try:
+            use_options = False
+            if num_predict is not None:
+                payload["options"] = {"temperature": 0.1, "num_predict": int(num_predict)}
+                use_options = True
+            else:
+                payload["temperature"] = 0.1
+
+            resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+            if resp.status_code != 200:
+                try:
+                    j = resp.json()
+                    if isinstance(j, dict) and isinstance(j.get("error"), str):
+                        return None, j["error"].strip()
+                except Exception:
+                    pass
+                try:
+                    body = (resp.text or "").strip()
+                except Exception:
+                    body = ""
+                return None, body or f"HTTP {resp.status_code}"
+
+            def _extract_text(obj):
+                if not isinstance(obj, dict):
+                    return None
+                if isinstance(obj.get("response"), str) and obj["response"].strip():
+                    return obj["response"].strip()
+                msg = obj.get("message")
+                if isinstance(msg, dict) and isinstance(msg.get("content"), str) and msg["content"].strip():
+                    return msg["content"].strip()
+                return None
+
+            try:
+                data = resp.json()
+            except Exception:
+                try:
+                    return None, (resp.text or "").strip() or "invalid response"
+                except Exception:
+                    return None, "invalid response"
+
+            text_out = _extract_text(data)
+            if text_out:
+                return text_out, None
+
+            # Some cloud models return only "thinking" when options are used; retry without options.
+            if use_options and isinstance(data.get("thinking"), str) and data["thinking"].strip():
+                try:
+                    payload2 = {
+                        "model": model_name,
+                        "prompt": prompt,
+                        "stream": False,
+                        "temperature": 0.1,
+                    }
+                    resp2 = requests.post(url, json=payload2, headers=headers, timeout=timeout)
+                    if resp2.status_code == 200:
+                        try:
+                            data2 = resp2.json()
+                        except Exception:
+                            data2 = None
+                        text2 = _extract_text(data2)
+                        if text2:
+                            return text2, None
+                except Exception:
+                    pass
+
+            return None, "empty response"
+        except Exception as e:
+            return None, str(e)
+
+    timeout = _ollama_timeout()
+    models = _list_ollama_models(timeout)
+    if models:
+        max_workers = int(TRW_OLLAMA_MAX_WORKERS)
+        max_workers = max(1, min(max_workers, len(models)))
+        num_predict = None
+        num_predict_env = os.environ.get("TRW_OLLAMA_NUM_PREDICT", "").strip()
+        if num_predict_env:
+            try:
+                num_predict = int(num_predict_env)
+            except Exception:
+                num_predict = None
+        show_errors = bool(TRW_OLLAMA_SHOW_ERRORS)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_call_ollama, m, input_text, timeout, num_predict): m for m in models}
+            for fut in as_completed(futures):
+                model = futures[fut]
+                label = _label_for_model(model)
+                try:
+                    text_ollama, err = fut.result()
+                except Exception as e:
+                    text_ollama, err = None, str(e)
+
+                if text_ollama:
+                    print(f"{label}:")
+                    print(" " + text_ollama)
+                elif show_errors and err:
+                    print(f"{label}:")
+                    print(" " + err)
+except Exception:
+    # silently skip if requests not available or server unreachable
+    pass
