@@ -3,6 +3,17 @@ import os
 import sys
 from guessit import guessit
 
+def is_hebrew_sub(srt_path):
+    """Return True if the subtitle file is a Hebrew subtitle."""
+    name = os.path.basename(srt_path).lower()
+    return (
+        name.endswith('.he.srt') or
+        name.endswith('.heb.srt') or
+        name.endswith('.en-he.srt') or
+        '-he.srt' in name or
+        '-heb.srt' in name
+    )
+
 def match_videos_to_subtitles(folder_path):
     video_files = []
     subtitle_files = []
@@ -18,79 +29,66 @@ def match_videos_to_subtitles(folder_path):
 
     subtitle_metadata = {}
 
-    # Process subtitle files and categorize them based on type
+    # Index only Hebrew subtitles by episode key
     for srt in subtitle_files:
+        if not is_hebrew_sub(srt):
+            continue
         metadata = guessit(srt)
         season = metadata.get('season')
         episode = metadata.get('episode')
         media_type = metadata.get('type')
 
-        # Handle episodes
         if media_type == "episode":
             if isinstance(episode, list):
                 episode_key = "-".join([f"e{ep:02d}" for ep in episode])
             else:
                 episode_key = f"e{episode:02d}"
             key = f"s{season:02d}{episode_key}"
-            
             if key not in subtitle_metadata:
                 subtitle_metadata[key] = []
             subtitle_metadata[key].append(srt)
 
-    # Handle subtitle conflicts for episodes
-    if subtitle_metadata:
-        for key, subs in subtitle_metadata.items():
-            if len(subs) > 1:
-                heb_subs = [s for s in subs if '.he.' in s.lower() or '.heb.' in s.lower()]
-                eng_subs = [s for s in subs if s not in heb_subs]
-                
-                if heb_subs and eng_subs:
-                    print(f"Found both Hebrew and English subtitles for {key}:")
-                    print("Hebrew:", ", ".join(heb_subs))
-                    print("English:", ", ".join(eng_subs))
-                    choice = input("Do you want to delete the English subtitles? (y/n): ").lower()
-                    if choice == 'y':
-                        for eng_sub in eng_subs:
-                            os.remove(eng_sub)
-                            print(f"Deleted: {eng_sub}")
-                        subtitle_metadata[key] = heb_subs
-
-    # Rename video files to match subtitle files
+    # Rename Hebrew subtitle to match video name exactly (no suffix)
     for video in video_files:
-        metadata = guessit(video)
-        season = metadata.get('season')
-        episode = metadata.get('episode')
-        media_type = metadata.get('type')
-        title = metadata.get('title')
+        video_metadata = guessit(video)
+        season = video_metadata.get('season')
+        episode = video_metadata.get('episode')
+        media_type = video_metadata.get('type')
+        title = video_metadata.get('title')
+        video_base = os.path.splitext(video)[0]  # video path without extension
+        target_srt = video_base + ".srt"
 
-        # Generate appropriate key based on type
         if media_type == "episode":
             if isinstance(episode, list):
                 episode_key = "-".join([f"e{ep:02d}" for ep in episode])
             else:
                 episode_key = f"e{episode:02d}"
             key = f"s{season:02d}{episode_key}"
-        elif media_type == "movie":
-            # For movies, match by title
-            key = f"movie-{title}"
 
-        # Match and rename based on the type
-        if media_type == "episode" and key in subtitle_metadata:
-            srt_filename = subtitle_metadata[key][0]  # Use the first (or only) subtitle file
-            new_video_filename = os.path.splitext(srt_filename)[0] + os.path.splitext(video)[1]
-            if video != new_video_filename:
-                os.rename(video, new_video_filename)
-                print(f"Renamed '{video}' to '{new_video_filename}'")
-        elif media_type == "movie":
-            # Rename movie file to match subtitle
-            matched_srt = next((srt for srt in subtitle_files if guessit(srt).get('title') == title), None)
-            if matched_srt:
-                new_movie_filename = os.path.splitext(matched_srt)[0] + os.path.splitext(video)[1]
-                if video != new_movie_filename:
-                    os.rename(video, new_movie_filename)
-                    print(f"Renamed movie '{video}' to '{new_movie_filename}'")
+            if key in subtitle_metadata:
+                srt = subtitle_metadata[key][0]
+                if srt != target_srt:
+                    os.rename(srt, target_srt)
+                    print(f"Renamed subtitle '{srt}' to '{target_srt}'")
+                else:
+                    print(f"Subtitle already correctly named: '{srt}'")
             else:
-                print(f"No matching subtitle file found for movie '{video}'")
+                print(f"No Hebrew subtitle found for {key}")
+
+        elif media_type == "movie":
+            matched_srt = next(
+                (srt for srt in subtitle_files if is_hebrew_sub(srt) and guessit(srt).get('title') == title),
+                None
+            )
+            if matched_srt:
+                if matched_srt != target_srt:
+                    os.rename(matched_srt, target_srt)
+                    print(f"Renamed subtitle '{matched_srt}' to '{target_srt}'")
+                else:
+                    print(f"Subtitle already correctly named: '{matched_srt}'")
+            else:
+                print(f"No Hebrew subtitle found for movie '{title}'")
+
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:

@@ -4,22 +4,22 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 import sys
 import os
-from deep_translator import GoogleTranslator, MyMemoryTranslator
 import re
-import chardet   
-from colorama import init, Fore, Style
 import time
 import signal
-import cohere
 import json
+import urllib.request
+import urllib.parse
 from collections import deque
+import chardet
+from colorama import init, Fore, Style
+import requests
 from langdetect import detect
+import cohere
 from openai import OpenAI
 import anthropic
-import time
-import signal
 
-#version 14.6.25
+#version 21.9.26
 
 DEBUG = False
 
@@ -256,6 +256,79 @@ def translate_cohere(texttoco, source_lang='english', target_lang='hebrew'):
         if DEBUG:
             print(f"Cohere translation error: {e}")
         pass
+
+_tr_session = None
+
+def _get_tr_session():
+    global _tr_session
+    if _tr_session is None:
+        _tr_session = requests.Session()
+    return _tr_session
+
+_MOBILE_UA = 'GoogleTranslate/6.28.0.05.357481116 (Linux; U; Android 11; Pixel 5)'
+_DESKTOP_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+_CLIENT_POOL = ("dict-chrome-ex", "at", "it", "gtx")
+
+def translate_google(text, source_lang='auto', target_lang='iw', retries=2):
+    """
+    Translates text using Google's Mobile App API with multi-client web failover.
+    Preserves subtitle timecodes, line numbering, and avoids 429 rate-limits.
+    """
+    if not text or not text.strip():
+        return text
+
+    # Map lang codes for Google Translate
+    src = 'iw' if source_lang == 'he' else source_lang
+    tgt = 'iw' if target_lang == 'he' else target_lang
+
+    sess = _get_tr_session()
+
+    # --- Engine 1: Google Mobile App API (fastest, preserves subtitle formatting) ---
+    url_mobile = "https://translate.google.com/translate_a/t"
+    params_mobile = {"client": "at", "sl": src, "tl": tgt, "v": "1.0"}
+    headers_mobile = {"User-Agent": _MOBILE_UA}
+    try:
+        resp = sess.post(url_mobile, params=params_mobile, data={"q": text}, headers=headers_mobile, timeout=12)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list) and data and isinstance(data[0], str):
+                return data[0]
+            if isinstance(data, str):
+                return data
+    except Exception as e:
+        if DEBUG:
+            print(f"Mobile API error: {e}")
+
+    # --- Engine 2: Multi-Client Desktop API Failover ---
+    url_desktop = "https://translate.googleapis.com/translate_a/single"
+    for client in _CLIENT_POOL:
+        params_desktop = {"client": client, "sl": src, "tl": tgt, "dt": "t"}
+        headers_desktop = {"User-Agent": _DESKTOP_UA}
+        try:
+            resp = sess.post(url_desktop, params=params_desktop, data={"q": text}, headers=headers_desktop, timeout=10)
+            if resp.status_code == 200:
+                res = resp.json()
+                if isinstance(res, list) and res and isinstance(res[0], list):
+                    translated = ''.join(part[0] for part in res[0] if isinstance(part, list) and part and part[0])
+                    if translated:
+                        return translated
+        except Exception as e:
+            if DEBUG:
+                print(f"Desktop API ({client}) error: {e}")
+            continue
+
+    # --- Fallback: If full chunk failed and chunk is large, try splitting into sub-chunks ---
+    if len(text) > 500 and '\n\n' in text:
+        mid = len(text) // 2
+        split_pos = text.rfind('\n\n', 0, mid + 200)
+        if split_pos != -1:
+            part1 = text[:split_pos + 2]
+            part2 = text[split_pos + 2:]
+            trans1 = translate_google(part1, source_lang, target_lang, retries=1)
+            trans2 = translate_google(part2, source_lang, target_lang, retries=1)
+            return trans1 + trans2
+
+    return text
  
 
 def read_file_with_detected_encoding(file_path):
@@ -334,23 +407,37 @@ def format_translated_chunks(translated_chunks):
     return '\n'.join(formatted_blocks)
 
 
-def smart_chunker(text, chunk_size):
+def smart_chunker(text, chunk_size=2500):
     chunks = []
     start_index = 0
-    while start_index < len(text):
+    text_len = len(text)
+    while start_index < text_len:
         # Find the end index for this chunk, which is start index + chunk size
         end_index = start_index + chunk_size
         
         # If the end index is beyond the length of the text, set it to the length of the text
-        if end_index > len(text):
-            end_index = len(text)
+        if end_index >= text_len:
+            end_index = text_len
         else:
             # Ensure the end index does not break in the middle of a subtitle entry
-            # Find the nearest previous newline character to avoid cutting a subtitle in half
-            end_index = text.rfind('\n\n', start_index, end_index) + 2
+            newline_pos = text.rfind('\n\n', start_index, end_index)
+            if newline_pos != -1 and newline_pos > start_index:
+                end_index = newline_pos + 2
+            else:
+                newline_pos = text.rfind('\n', start_index, end_index)
+                if newline_pos != -1 and newline_pos > start_index:
+                    end_index = newline_pos + 1
+                else:
+                    end_index = min(start_index + chunk_size, text_len)
+        
+        # Ensure progress to prevent infinite loop
+        if end_index <= start_index:
+            end_index = min(start_index + chunk_size, text_len)
         
         # Append the current chunk to the list of chunks
-        chunks.append(text[start_index:end_index])
+        chunk = text[start_index:end_index]
+        if chunk:
+            chunks.append(chunk)
         
         # Update the start index for the next chunk
         start_index = end_index
@@ -457,61 +544,66 @@ def translate_file(file_path, translator, target_lang='he', target_lang_full='he
         print(f"Detected language: {full_lang_detected}")
         print(f"Target language: {target_lang_full}\n")
         
-        translated_chunks = []
-        
         if file_extension == '.srt':
-            chunk_size = 3500
+            chunk_size = 2500
             text_chunks = smart_chunker(text, chunk_size)
         else:
-            # For large text files, use very small chunks to prevent memory issues
-            chunk_size = 3500  # Much smaller chunks for stability
+            # For large text files, use smaller chunks for stability
+            chunk_size = 3500
             text_chunks = text_chunker(text, chunk_size)
-            # text_chunks = smart_chunker(text, chunk_size)
             
-        translated_chunks = []
-        
         if DEBUG:
             print(f"Total text length: {len(text)} characters")
             print(f"Chunk size: {chunk_size} characters")
             print(f"Number of chunks: {len(text_chunks)}")
            
         translated_chunks = []
+        total_chunks = len(text_chunks)
+        
+        # Base language info from detected file language
+        base_source_code = 'iw' if s == 'he' else (s if s else 'auto')
+        base_source_name = full_lang_detected if full_lang_detected else ('hebrew' if s == 'he' else 'english')
         
         for i, chunk in enumerate(text_chunks):
-            print(f"Translating chunk {i+1}/{len(text_chunks)} ({round((i+1)/len(text_chunks)*100, 1)}%)", end='\r')
+            pct = round((i + 1) / total_chunks * 100, 1)
+            sys.stdout.write(f"\r\033[KTranslating chunk {i+1}/{total_chunks} ({pct}%)")
+            sys.stdout.flush()
             
             try:
-                source_language = detect(chunk)
-                
-                # Map detected language to Google Translate format
-                source_lang_code = 'iw' if source_language == 'he' else source_language
-                
-                # Determine source language name for AI translators
-                source_lang_name = 'hebrew' if source_language == 'he' else 'english'
-                
-                if translator=="google":
-                    # Create GoogleTranslator with proper source and target languages
-                    trs = GoogleTranslator(source=source_lang_code, target=google_lang_code)
-                    translated_chunk = trs.translate(chunk)
-                elif translator=="cohere":
-                    translated_chunk = translate_cohere(chunk, source_lang_name, target_lang_full)
-                elif translator=="chatgpt":
-                    translated_chunk = translate_gpt(chunk, source_lang_name, target_lang_full)
-                elif translator=="claude":
-                    translated_chunk = translate_claude(chunk, source_lang_name, target_lang_full)
+                if translator == "google":
+                    translated_chunk = translate_google(chunk, source_lang=base_source_code, target_lang=google_lang_code)
+                elif translator == "cohere":
+                    translated_chunk = translate_cohere(chunk, base_source_name, target_lang_full)
+                elif translator == "chatgpt":
+                    translated_chunk = translate_gpt(chunk, base_source_name, target_lang_full)
+                elif translator == "claude":
+                    translated_chunk = translate_claude(chunk, base_source_name, target_lang_full)
+                else:
+                    translated_chunk = translate_google(chunk, source_lang=base_source_code, target_lang=google_lang_code)
                      
+                if not translated_chunk:
+                    translated_chunk = chunk
                 translated_chunks.append(translated_chunk)
                 
-                # Add small delay to prevent rate limiting
-                time.sleep(0.05)
+                # Small delay between chunks to avoid rate limiting
+                time.sleep(0.15 if translator == "google" else 0.05)
                 
             except Exception as e:
-                print(f"\nError with chunk {i+1}: {e}")
+                if DEBUG:
+                    err_msg = getattr(e, 'message', str(e)[:100])
+                    sys.stdout.write(f"\n[DEBUG] Error with chunk {i+1}: {type(e).__name__} - {err_msg}\n")
+                    sys.stdout.flush()
                 translated_chunks.append(chunk)  # Keep original if translation fails
             
-        
-        #after translating all chunks, format them
-        formatted_translated_text = format_translated_chunks(translated_chunks)
+        # Clean newline after progress completes
+        sys.stdout.write('\n')
+        sys.stdout.flush()
+
+        # Format translated chunks according to file type
+        if file_extension.lower() == '.srt':
+            formatted_translated_text = format_translated_chunks(translated_chunks)
+        else:
+            formatted_translated_text = ''.join(translated_chunks)
 
         # Write the formatted translated text to the output file
         with open(output_file_path, 'w') as output_file:

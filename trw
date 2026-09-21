@@ -9,79 +9,270 @@ import anthropic
 from openai import OpenAI
 import os
 import subprocess
+import shutil
+import tempfile
+import time
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 try:
     import requests
 except Exception:
     requests = None
+from bidi.algorithm import get_display
+import unicodedata
+import re
 
+TRW_OLLAMA_MAX_WORKERS = 1  # sequential only
+TRW_OLLAMA_READ_TIMEOUT = 120  # seconds
+TRW_OLLAMA_SHOW_ERRORS = 1 # 1=show errors/timeouts, 0=hide
 
-TRW_OLLAMA_MAX_WORKERS = 3  # Suggested: 1-3 for cloud; start with 2
-TRW_OLLAMA_READ_TIMEOUT = 15  # seconds; Suggested: 20-60
-TRW_OLLAMA_SHOW_ERRORS = 0 # 1=show errors/timeouts, 0=hide
-TRW_OLLAMA_MODEL_FILTER = "gpt-oss|gemma3|gemini|glm"   
-
-client_oi = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+client_oi = None
 modelSource = "gpt-5.1"
 
-co = cohere.Client(os.environ["COHERE_API_KEY"])
-modelco= 'command-a-translate-08-2025'
+co = None
+modelco = "command-a-translate-08-2025"
 
-client_an = anthropic.Anthropic()
+client_an = None
 model = "claude-sonnet-4-5-20250929"
+global prompt_global
+prompt_global = (
+    "You are an expert English-to-Hebrew translator.\n"
+    "Translate the MEANING of the user's word/phrase into natural, spoken Hebrew.\n"
+    "Preserve meaning, context, and slang. Do not do a cold literal translation.\n"
+    "\n"
+    "=== ABSOLUTE RULE: TRANSLATE, NEVER TRANSLITERATE ===\n"
+    "Transliteration means writing the English SOUND with Hebrew letters. This is FORBIDDEN.\n"
+    "You must return a real Hebrew word that a Hebrew speaker uses, carrying the same meaning.\n"
+    "If the output is just the English pronunciation spelled in Hebrew letters, it is WRONG.\n"
+    "Self-check before answering: would a Hebrew speaker who knows NO English understand it?\n"
+    "If no, you transliterated. Replace it with the real Hebrew word.\n"
+    "\n"
+    "WRONG (transliteration): 'caveat' -> 'קווייט'\n"
+    "CORRECT (translation):   'caveat' -> 'הסתייגות' (או: אזהרה, סייג)\n"
+    "WRONG (transliteration): 'deadline' -> 'דדליין'\n"
+    "CORRECT (translation):   'deadline' -> 'מועד אחרון'\n"
+    "WRONG (transliteration): 'leverage' -> 'לברג''\n"
+    "CORRECT (translation):   'leverage' -> 'למנף, לנצל יתרון'\n"
+    "WRONG (transliteration): 'bottleneck' -> 'בוטלנק'\n"
+    "CORRECT (translation):   'bottleneck' -> 'צוואר בקבוק'\n"
+    "\n"
+    "ONLY exception: a foreign word that is genuinely part of everyday Hebrew and has no real\n"
+    "Hebrew equivalent (for example 'טלפון', 'אינטרנט', 'פיצה'). If a Hebrew word exists, use it.\n"
+    "\n"
+    "Output ONLY the Hebrew translation. No analysis. No explanations. No English at all.\n"
+    "NEVER print the original English word. NEVER use formats like 'word: translation', "
+    "'word = translation', or 'word - translation'.\n"
+    "WRONG: 'cheesy - חנוני'  WRONG: 'cheesy: חנוני'  WRONG: 'cheesy = חנוני'\n"
+    "CORRECT: 'חנוני ורגשני מדי'\n"
+    "You may add up to 5-6 extra Hebrew words only if needed to make the meaning clear.\n"
+    "Do NOT add niqqud (vowel marks). Return Hebrew letters only."
+)
+        
+if os.environ.get("OPENAI_API_KEY"):
+    client_oi = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+if os.environ.get("COHERE_API_KEY"):
+    co = cohere.Client(os.environ["COHERE_API_KEY"])
+if os.environ.get("ANTHROPIC_API_KEY"):
+    client_an = anthropic.Anthropic()
 
 
-translator = GoogleTranslator(source='en', target='iw')
-input_text = ' '.join(sys.argv[1:])  # Join all command-line arguments after the script name
+args = sys.argv[1:]
+use_ollama = False
+if "-a" in args:
+    use_ollama = True
+    args = [a for a in args if a != "-a"]
 
-# trans (translate-shell)
+input_text = ' '.join(args)  # Join all command-line arguments after the script name
+
+
+# ---------------------------------------------------------------- language ---
+# Auto-identify the language of the input, so the real language is passed to
+# 'say', translate-shell, deep-translator and GoogleTranslator instead of a
+# hardcoded 'en'. Codes use the legacy Google form ('iw' for Hebrew), which is
+# what all four of those tools expect.
+LANG_NAMES = {
+    "en": "English",
+    "tl": "Filipino",
+    "ar": "Arabic",
+    "ru": "Russian",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+    "it": "Italian",
+    "pt": "Portuguese",
+}
+LANG_CODES = tuple(LANG_NAMES)
+
+# Unicode blocks that identify a language by script alone (always exact).
+SCRIPT_RANGES = [
+    ("ar", "؀", "ۿ"),   # Arabic
+    ("ru", "Ѐ", "ӿ"),   # Cyrillic
+]
+
+
+def detect_lang(text):
+    """Identify the language of the input text.
+
+    Script detection first: exact, cannot be fooled.
+    Statistical detection only for 3+ words, because n-gram detectors are
+    unreliable on a single word ('caveat' is detected as Romanian).
+    Anything shorter or unrecognised falls back to English.
+    """
+    for ch in text:
+        for code, low, high in SCRIPT_RANGES:
+            if low <= ch <= high:
+                return code
+
+    if len(text.split()) >= 3:
+        try:
+            from langdetect import detect, DetectorFactory
+            DetectorFactory.seed = 0  # make detection deterministic
+            code = detect(text)
+            if code in LANG_CODES:
+                return code
+        except Exception:
+            pass
+    return "en"
+
+
+src_lang = detect_lang(input_text) if input_text.strip() else "en"
+tgt_lang = "iw"  # target is always Hebrew
+
+translator = GoogleTranslator(source=src_lang, target=tgt_lang)
+
+# Appended to the shared prompt (the block above is left untouched).
+# The AI models decide the source language themselves; the script's detection
+# is handed over as a hint only, since it cannot separate Latin-script
+# languages on a single word.
+prompt_global += (
+    "\n\n"
+    "=== SOURCE LANGUAGE ===\n"
+    "The input is NOT always English. Identify the source language yourself, from the word.\n"
+    "An automatic script-based detector guessed: %s.\n"
+    "Treat that guess as a HINT ONLY, never as truth. It reads the alphabet, not the meaning,\n"
+    "so it cannot separate English from Filipino, Spanish, Italian or Portuguese on a single\n"
+    "word, and it defaults to English whenever it is unsure.\n"
+    "If your own reading of the word disagrees with the guess, trust yourself and translate\n"
+    "from the language you identified.\n"
+    "Wherever the rules above say 'English', read it as 'the source language you identified'.\n"
+    "The target NEVER changes: the output is always Hebrew, under all the rules above.\n"
+    "Do not name or mention the detected language in your answer. Output only the Hebrew.\n"
+    "\n"
+    "No language is ever out of scope. Filipino, Spanish, Russian, Arabic, slang, a proper\n"
+    "noun: translate it to Hebrew anyway. NEVER refuse and NEVER say it is outside your scope.\n"
+    "NEVER write a single Latin letter in your answer. Do not repeat the input. Do not explain\n"
+    "what language it is. Do not add a label such as 'Hebrew:' before the translation.\n"
+    "WRONG: 'this is Tagalog, not English, so it is outside my scope. Hebrew: נגמר לי איתך'\n"
+    "CORRECT: 'נגמר לי איתך'\n"
+    "Your entire answer must be Hebrew letters only, nothing before it and nothing after it."
+) % LANG_NAMES.get(src_lang, src_lang)
+
+
+# Pronounce the word before translating.
+# Only shown if the 'say' script is installed in the user's PATH, so the
+# script stays portable for anyone cloning it from GitHub without 'say'.
+if input_text.strip():
+    print("detect language: %s" % LANG_NAMES.get(src_lang, src_lang), flush=True)
+
+say_bin = shutil.which("say")
+if say_bin and input_text.strip():
+    # flush: make sure the line is on screen before the audio starts
+    print("Word: %s   pronoun: \U0001f50a" % input_text, flush=True)
+    # time.sleep(1)
+    try:
+        # blocking: wait until the audio finished playing before running the models
+        # cwd=temp dir: 'say' writes output.mp3 next to itself, keep it out of the user's folder
+        # -l <detected>: pronounce the word with the voice of its own language.
+        # Older versions of 'say' have no -l flag, so fall back to a bare call.
+        r = subprocess.run([say_bin, "-l", src_lang, input_text],
+                           cwd=tempfile.gettempdir(),
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL,
+                           timeout=30)
+        if r.returncode != 0:
+            subprocess.run([say_bin, input_text],
+                           cwd=tempfile.gettempdir(),
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL,
+                           timeout=30)
+        # time.sleep(1)
+    except Exception:
+        pass
+    print("")
+
+
+def strip_niqqud(s):
+    return ''.join(ch for ch in s if unicodedata.category(ch) != 'Mn')
+
+
+HEB_RE = re.compile(r'[֐-׿]')
+
+
+def hebrew_only(s):
+    """Strip any English commentary a model wrapped around its translation.
+
+    Some CLI backends answer conversationally ("this is Tagalog, not English...")
+    even when told not to. Keeping only the Hebrew also fixes the display:
+    maybe_bidi_fix() decides by the FIRST strong character, so a leading English
+    sentence makes it reverse the Hebrew that follows.
+    """
+    lines = [l for l in s.splitlines() if HEB_RE.search(l)]
+    if not lines:
+        return s.strip()
+    out = []
+    for l in lines:
+        l = re.sub(r'[A-Za-z]+', '', l)            # drop Latin words
+        l = re.sub(r'[ \t]{2,}', ' ', l)           # collapse the gaps they leave
+        l = l.strip(' \t-–—:;,."\'()[]')
+        if l:
+            out.append(l)
+    return ' '.join(out).strip() or s.strip()
+
+
+def maybe_bidi_fix(s):
+    s = strip_niqqud(s)
+    for ch in s:
+        b = unicodedata.bidirectional(ch)
+        if b in ("R","AL","RLE","RLO"):
+            return s
+        if b in ("L","LRE","LRO"):
+            break
+    return get_display(s)
+
+
 try:
-    result = subprocess.run(['trans', '-t', 'iw', '-b', '--no-bidi', input_text], 
+    result = subprocess.run(['trans', '-s', src_lang, '-t', tgt_lang,'-b','--no-bidi', input_text],
                           capture_output=True, text=True, timeout=5)
     if result.returncode == 0 and result.stdout.strip():
         print("translate-shell:")
-        print(" " + result.stdout.strip())
+        fixed = maybe_bidi_fix(result.stdout.strip())
+        print(fixed)
 except Exception as e:
     pass
 
-# deep-translator (command-line)
+
+
 try:
-    result = subprocess.run(['deep-translator', '--source', 'en', '--target', 'iw', '--text', input_text], 
+    result = subprocess.run(['deep-translator', '--source', src_lang, '--target', tgt_lang, '--text', input_text],
                           capture_output=True, text=True, timeout=5)
     if result.returncode == 0 and result.stdout.strip():
-        # Extract only the translation result after "Translation result:"
         output = result.stdout.strip()
         if "Translation result:" in output:
             translation = output.split("Translation result:")[-1].strip()
+            new_text = maybe_bidi_fix(translation)
             print("deep-translator:")
-            print(" " + translation)
-        else:
-            print("deep-translator:")
-            print(" " + output)
+            print(" " + new_text)
 except Exception as e:
     pass
 
-# googletrans library
-try:
-    from googletrans import Translator
-    gt = Translator()
-    result = gt.translate(input_text, dest='iw').text
-    if result:
-        print("googletrans library:")
-        print(" " + result)
-except Exception as e:
-    pass
 
 try:
     result = translator.translate(input_text)
     if result:
-        print("google:\n",result)
-    else:
-        print("Translation failed. No text returned.")
+        new_text = maybe_bidi_fix(result)
+        print("google:\n",new_text)
 except Exception as e:
-    print("Translation failed. Error:", str(e))
-
+     pass #print("Translation failed. Error:", str(e))
 
 try:
     text=""
@@ -91,12 +282,7 @@ try:
             message="translate this to hebrew: "+input_text,
             temperature=0.7,
             stream=True,
-            preamble="""you are transaltor expert in english and hebrew. 
-            you going to translate from english to hebrew.
-            your respond should be only the translate nothing else.
-            i need you to think on the context from user not just colde translate. 
-            i also need you figure sland of people . dont just transalte words but think how they use it and that translte. 
-              """
+            preamble=prompt_global
         ):
 
         if event.event_type == "text-generation":
@@ -111,7 +297,6 @@ try:
     print("")
 except Exception as e:
     pass
-    #print("Translation failed. Error:", str(e))
 
 
 try: 
@@ -119,13 +304,7 @@ try:
     with client_an.messages.stream(
         model=model,
         max_tokens=4000,
-        system=f"""
-             you are transaltor expert in english and hebrew. 
-             you going to translate from english to hebrew.
-             your respond should be only the translate nothing else.
-             i need you to think on the context from user not just colde translate. 
-             i also need you figure sland of people . dont just transalte words but think how they use it and that translte.         
-        """,
+        system=prompt_global,
          messages=[
             {
                 "role": "user", 
@@ -144,7 +323,6 @@ try:
 except Exception as e:
     if "credit balance" not in str(e).lower():
         pass
-    # Silently skip if no credits
 
 try:
     text=""
@@ -153,13 +331,7 @@ try:
     messages=[
         {
             'role': 'system',
-            'content': f"""
-             you are transaltor expert in english and hebrew. 
-             you going to translate from english to hebrew.
-             your respond should be only the translate nothing else.
-             i need you to think on the context from user not just colde translate. 
-             i also need you figure sland of people . dont just transalte words but think how they use it and that translte.         
-        """
+            'content': prompt_global
         },
         
         {
@@ -172,8 +344,6 @@ try:
     temperature=1,
     max_completion_tokens=3000
     )
-    # temptext = response.choices[0].delta.content
-    # print(response)
     for chunk in response:
         if chunk.choices[0].delta.content is not None:  
             temptext = chunk.choices[0].delta.content
@@ -184,11 +354,11 @@ try:
 
 except Exception as e:
     pass
-#     print("Translation failed. Error:", str(e))
 
 
-# Ollama translations
 try:
+    if not use_ollama:
+        raise Exception("SKIP_OLLAMA")
     def _find_first_string(obj):
         if isinstance(obj, str):
             return obj
@@ -216,91 +386,35 @@ try:
         read_timeout = float(TRW_OLLAMA_READ_TIMEOUT)
         return (connect_timeout, read_timeout)
 
-    def _get_model_filter():
-        f = str(TRW_OLLAMA_MODEL_FILTER or "").strip()
-        if not f:
-            f = os.environ.get("TRW_OLLAMA_MODEL_FILTER", "").strip()
-        return f
-
     def _label_for_model(model_name):
-        model_filter = _get_model_filter()
-        if model_filter:
-            try:
-                import re
-                m = re.search(model_filter, model_name)
-                if m and m.group(0):
-                    return m.group(0)
-            except Exception:
-                pass
         base = model_name.split(":", 1)[0] if ":" in model_name else model_name
         return base
 
     def _list_ollama_models(timeout):
-        if not requests:
-            return []
+        aliases = {
+            "gpt-oss": "gpt-oss:latest",
+            "glm": "glm-4.7-flash:latest",
+        }
 
-        models_env = os.environ.get("TRW_OLLAMA_MODELS", "").strip()
-        if models_env:
-            out = []
-            for part in models_env.split(","):
-                name = part.strip()
-                if name:
-                    out.append(name)
-            return out
+        return [
+           aliases["gpt-oss"],
+           aliases["glm"],
+        ]
 
-        url = "http://127.0.0.1:11434/api/tags"
-        try:
-            resp = requests.get(url, timeout=timeout)
-            if resp.status_code != 200:
-                return []
-            data = resp.json()
-            models = []
-            for m in data.get("models", []):
-                name = m.get("name") or m.get("model")
-                if isinstance(name, str) and name.strip():
-                    models.append(name.strip())
-
-            model_filter = _get_model_filter()
-            if model_filter:
-                try:
-                    import re
-                    pat = re.compile(model_filter)
-                    models = [n for n in models if pat.search(n)]
-                except Exception:
-                    pass
-
-            seen = set()
-            out = []
-            for n in models:
-                if n not in seen:
-                    seen.add(n)
-                    out.append(n)
-            return out
-        except Exception:
-            return []
-
-    def _call_ollama(model_name, text, timeout, num_predict):
+    def _call_ollama(model_name, text, timeout):
         if not requests:
             return None, "requests unavailable"
-        url = "http://127.0.0.1:11434/api/generate"
-        prompt = (
-            "HEBREW ONLY. Translate English to Hebrew. Keep meaning/slang.\n"
-            "No analysis. No explanations. Output only the Hebrew translation:\n\n"
-            + text
-        )
+        url = "http://127.0.0.1:11434/api/chat"
+        prompt = (prompt_global +"\n\n  the text from user is: " + text).strip()
         payload = {
             "model": model_name,
-            "prompt": prompt,
+            "messages": [{"role": "user", "content": prompt}],
             "stream": False,
+            "think": False,
         }
         headers = {"Content-Type": "application/json"}
         try:
-            use_options = False
-            if num_predict is not None:
-                payload["options"] = {"temperature": 0.1, "num_predict": int(num_predict)}
-                use_options = True
-            else:
-                payload["temperature"] = 0.1
+            payload["options"] = {"temperature": 0.1}
 
             resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
             if resp.status_code != 200:
@@ -316,48 +430,31 @@ try:
                     body = ""
                 return None, body or f"HTTP {resp.status_code}"
 
-            def _extract_text(obj):
-                if not isinstance(obj, dict):
-                    return None
-                if isinstance(obj.get("response"), str) and obj["response"].strip():
-                    return obj["response"].strip()
-                msg = obj.get("message")
-                if isinstance(msg, dict) and isinstance(msg.get("content"), str) and msg["content"].strip():
-                    return msg["content"].strip()
-                return None
-
             try:
                 data = resp.json()
             except Exception:
-                try:
-                    return None, (resp.text or "").strip() or "invalid response"
-                except Exception:
-                    return None, "invalid response"
+                return (resp.text or "").strip(), None
 
-            text_out = _extract_text(data)
-            if text_out:
-                return text_out, None
-
-            # Some cloud models return only "thinking" when options are used; retry without options.
-            if use_options and isinstance(data.get("thinking"), str) and data["thinking"].strip():
-                try:
-                    payload2 = {
-                        "model": model_name,
-                        "prompt": prompt,
-                        "stream": False,
-                        "temperature": 0.1,
-                    }
-                    resp2 = requests.post(url, json=payload2, headers=headers, timeout=timeout)
-                    if resp2.status_code == 200:
-                        try:
-                            data2 = resp2.json()
-                        except Exception:
-                            data2 = None
-                        text2 = _extract_text(data2)
-                        if text2:
-                            return text2, None
-                except Exception:
-                    pass
+            msg = data.get("message") #if isinstance(data, dict) else None
+            text_out = msg.get("content") #if isinstance(msg, dict) else None
+            return text_out.strip(),None                         
+            
+            if model_name.startswith("gpt-oss"):
+                thinking = None
+                if isinstance(msg, dict):
+                    thinking = msg.get("thinking")
+                if not thinking and isinstance(data, dict):
+                    thinking = data.get("thinking")
+                if isinstance(thinking, str) and thinking.strip():
+                    try:
+                        import re
+                        heb = re.findall(r"[\u0590-\u05FF][\u0590-\u05FF\s\"\u05f4\u05f3\?\!\.,\-]*", thinking)
+                        if heb:
+                            return heb[-1].strip().strip('"\'') , None
+                        else:
+                            return None, None
+                    except Exception:
+                        pass
 
             return None, "empty response"
         except Exception as e:
@@ -368,31 +465,54 @@ try:
     if models:
         max_workers = int(TRW_OLLAMA_MAX_WORKERS)
         max_workers = max(1, min(max_workers, len(models)))
-        num_predict = None
-        num_predict_env = os.environ.get("TRW_OLLAMA_NUM_PREDICT", "").strip()
-        if num_predict_env:
-            try:
-                num_predict = int(num_predict_env)
-            except Exception:
-                num_predict = None
         show_errors = bool(TRW_OLLAMA_SHOW_ERRORS)
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_call_ollama, m, input_text, timeout, num_predict): m for m in models}
-            for fut in as_completed(futures):
-                model = futures[fut]
-                label = _label_for_model(model)
-                try:
-                    text_ollama, err = fut.result()
-                except Exception as e:
-                    text_ollama, err = None, str(e)
+        for model in models:
+            label = _label_for_model(model)
+            try:
+                text_ollama, err = _call_ollama(model, input_text, timeout)
+            except Exception as e:
+                text_ollama, err = None, str(e)
 
-                if text_ollama:
-                    print(f"{label}:")
-                    print(" " + text_ollama)
-                elif show_errors and err:
-                    print(f"{label}:")
-                    print(" " + err)
-except Exception:
-    # silently skip if requests not available or server unreachable
-    pass
+            if text_ollama:
+                print(f"{label}:")
+                print(" " + text_ollama)
+            elif show_errors and err:
+                print(f"{label}:")
+                print(" " + err)
+    else:
+        print("ollama models: none")
+except Exception as e:
+    if str(e) != "SKIP_OLLAMA":
+        print(f"Ollama error: {e}")
+
+
+try:
+    message = prompt_global + " the word from user is: " + input_text
+    result = subprocess.run(['codex-run', message],
+                          capture_output=True, text=True, timeout=25)
+    if result.returncode == 0 and result.stdout.strip():
+        print("codex:")
+        print(" " + maybe_bidi_fix(hebrew_only(result.stdout.strip())))
+    else:
+        # print("codex debug: returncode=", result.returncode)
+        # print("codex debug: stdout=", repr(result.stdout))
+        # print("codex debug: stderr=", repr(result.stderr))
+        pass
+except Exception as e:
+    print("codex debug: exception=", e)
+
+try:
+    message = prompt_global + " the word from user is: " + input_text
+    result = subprocess.run(['claude-run', message],
+                          capture_output=True, text=True, timeout=25)
+    if result.returncode == 0 and result.stdout.strip():
+        print("claude:")
+        print(" " + maybe_bidi_fix(hebrew_only(result.stdout.strip())))
+    else:
+        # print("claude debug: returncode=", result.returncode)
+        # print("claude debug: stdout=", repr(result.stdout))
+        # print("claude debug: stderr=", repr(result.stderr))
+        pass
+except Exception as e:
+    print("claude debug: exception=", e)

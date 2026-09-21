@@ -23,6 +23,24 @@ if [ -z "$1" ]; then
     show_help
 fi
 
+# Function to check if Hebrew subtitle already exists for a video file
+hebrew_sub_exists() {
+    local video_file="$1"
+    local base_name
+    base_name=$(basename "$video_file" | sed 's/\.[^.]*$//')
+    local dir_name
+    dir_name=$(dirname "$video_file")
+
+    for sub_file in "$dir_name/$base_name"*.srt; do
+        if [[ -f "$sub_file" ]]; then
+            if [[ "$sub_file" =~ \.(he|heb)\.srt$ || "$sub_file" =~ -heb\.srt$ || "$sub_file" =~ \.en-he\.srt$ ]]; then
+                return 0  # Hebrew sub found
+            fi
+        fi
+    done
+    return 1  # No Hebrew sub found
+}
+
 # Function to download subtitles
 download_subs() {
     local pathi="$1"
@@ -60,11 +78,11 @@ find_subtitle() {
     # No Hebrew subtitle was found, so proceed with translating non-Hebrew subtitles
     for sub_file in "$dir_name/$base_name"*.srt; do
         if [[ -f "$sub_file" ]]; then
-          #  echo -e "\033[1;32mTranslating subtitle file: $sub_file\033[0m"
             trf -f "$sub_file"  # Translate the subtitle file
         fi
     done
 }
+
 # Determine if the input is a file or directory and process accordingly
 if [ -f "$1" ]; then
     # Handle file
@@ -77,20 +95,39 @@ if [ -f "$1" ]; then
 elif [ -d "$1" ]; then
     # Handle directory
     cd "$1" || exit 1
+
+    # Download subtitles for all video files
     for video_file in *.{mkv,mp4,avi,ts}; do
         if [ -f "$video_file" ]; then
             download_subs "$video_file" "en" ""
             download_subs "$video_file" "heb" "-e UTF-8"
         fi
     done
-    # vidsubs "$1"
-    echo ""
-    echo -e "\033[1;32mTranslate subtitles for directory\033[0m"
-    # Try using different translators if one fails
-    if ! trf -d "$1"; then
-        if ! trf -d "$1" -cl; then
-            if ! trf -d "$1" -gp; then
-                trf -d "$1" -co
+
+    # Check if any video already has a Hebrew subtitle downloaded
+    # If ALL videos have Hebrew subs, skip translation entirely
+    needs_translation=false
+    for video_file in *.{mkv,mp4,avi,ts}; do
+        if [ -f "$video_file" ]; then
+            if ! hebrew_sub_exists "$video_file"; then
+                needs_translation=true
+                break
+            fi
+        fi
+    done
+
+    if [ "$needs_translation" = false ]; then
+        echo ""
+        echo -e "\033[1;33mHebrew subtitles already downloaded for all files. Skipping translation.\033[0m"
+    else
+        echo ""
+        echo -e "\033[1;32mTranslate subtitles for directory\033[0m"
+        # Try using different translators if one fails
+        if ! trf -d "$1"; then
+            if ! trf -d "$1" -cl; then
+                if ! trf -d "$1" -gp; then
+                    trf -d "$1" -co
+                fi
             fi
         fi
     fi
@@ -101,11 +138,3 @@ else
 fi
 
 echo "Operation complete"
-
-# status=$?
-# if [ $status -eq 0 ]; then
-#     echo "Operation complete"
-#     exit 0
-# else
-#     exit 1
-# fi
